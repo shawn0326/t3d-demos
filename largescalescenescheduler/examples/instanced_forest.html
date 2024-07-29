@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="utf-8">
+	<title>instanced forest</title>
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	<link type="text/css" rel="stylesheet" href="main.css">
+</head>
+
+<body>
+
+	<div id="info">
+        Efficiently rendering 150k trees on expansive terrain.
+    </div>
+
+	<script type="importmap">
+        {
+            "imports": {
+                "t3d": "../node_modules/t3d/build/t3d.module.js",
+                "t3d/addons/": "../node_modules/t3d/examples/jsm/"
+            }
+        }
+    </script>
+
+	<script type="module">
+		import * as t3d from 't3d';
+		import { SkyBox } from 't3d/addons/objects/SkyBox.js';
+		import { OrbitControls } from 't3d/addons/controls/OrbitControls.js';
+		import { ForwardRenderer } from 't3d/addons/render/ForwardRenderer.js';
+		import { ShadowAdapter } from 't3d/addons/math/ShadowAdapter.js';
+		import { TextureCubeLoader } from 't3d/addons/loaders/TextureCubeLoader.js';
+		import { GLTFLoader } from 't3d/addons/loaders/glTF/GLTFLoader.js';
+		import { InstancedPBRMaterial } from 't3d/addons/materials/InstancedPBRMaterial.js';
+		import { GeometryUtils } from 't3d/addons/geometries/GeometryUtils.js';
+		import { OctreeHelper } from 't3d/addons/objects/OctreeHelper.js';
+		import { SceneUtils } from 't3d/addons/SceneUtils.js';
+
+		import { LargeScaleInstancedManager } from '../dist/large-scale-scheduler.module.js';
+		
+		import { Terrain } from './libs/Terrain.js';
+		import { GUI } from './libs/lil-gui.esm.min.js';
+		import Stats from './libs/stats.module.js';
+
+		const fov = 45, near = 1, far = 40000;
+
+		let width = window.innerWidth || 2;
+		let height = window.innerHeight || 2;
+
+		const canvas = document.createElement('canvas');
+		canvas.width = width;
+		canvas.height = height;
+		document.body.appendChild(canvas);
+
+		const forwardRenderer = new ForwardRenderer(canvas);
+		forwardRenderer.setClearColor(0.1, 0.1, 0.1, 1);
+
+		const scene = new t3d.Scene();
+		const fog = new t3d.Fog(0xddddff, 500, 15000);
+		scene.fog = fog;
+
+		const camera = new t3d.Camera();
+		camera.outputEncoding = t3d.TEXEL_ENCODING_TYPE.SRGB;
+		camera.lookAt(new t3d.Vector3(0, 0, 0), new t3d.Vector3(0, 1, 0));
+		camera.setPerspective(fov / 180 * Math.PI, width / height, near, far);
+		camera.position.set(0, 500, 1500);
+		scene.add(camera);
+
+		const debugCamera = new t3d.Camera();
+		debugCamera.outputEncoding = t3d.TEXEL_ENCODING_TYPE.SRGB;
+		debugCamera.setPerspective(fov / 180 * Math.PI, width / height, near, far);
+		scene.add(debugCamera);
+
+		const controls = new OrbitControls(camera, canvas);
+		controls.target.set(0, 100, 0);
+
+		const debugController = new OrbitControls(debugCamera, canvas);
+		debugController.enablePan = true;
+		debugController.enabled = false;
+
+		const skyboxTexture = new TextureCubeLoader().load([
+			'./images/sky_box/right.jpg',
+			'./images/sky_box/left.jpg',
+			'./images/sky_box/top.jpg',
+			'./images/sky_box/bottom.jpg',
+			'./images/sky_box/front.jpg',
+			'./images/sky_box/back.jpg'
+		]);
+		skyboxTexture.encoding = t3d.TEXEL_ENCODING_TYPE.SRGB;
+
+		scene.environment = skyboxTexture;
+		const sky_box = new SkyBox(skyboxTexture);
+		sky_box.gamma = true;
+		sky_box.fog = true;
+		fog.color.toArray(sky_box.material.uniforms.fogColor);
+		sky_box.material.uniforms.fogHeight = 0.02;
+		scene.add(sky_box);
+
+		const ambientLight = new t3d.AmbientLight(0xffffff, 0.3);
+		scene.add(ambientLight);
+
+		const directionalLight = new t3d.DirectionalLight(0xffffff, 3.0);
+		directionalLight.castShadow = true;
+		directionalLight.shadow.mapSize.set(2048, 2048);
+		directionalLight.shadow.bias = -0.013;
+		directionalLight.shadow.normalBias = 0.01;
+		directionalLight.shadow.frustumEdgeFalloff = 0.5;
+		scene.add(directionalLight);
+
+		console.time('create terrain');
+
+		const planeSize = 20000;
+		const vertexNumber = 1600;
+		const terrain = new Terrain(planeSize, planeSize, vertexNumber, vertexNumber);
+		terrain.loadTexture(
+			'./images/terrain/terrain_base.png',
+			'./images/terrain/terrain_normal.png'
+		);
+		const terrainMesh = terrain.getMesh();
+		GeometryUtils.computeNormals(terrainMesh.geometry);
+		terrainMesh.castShadow = true;
+		terrainMesh.receiveShadow = true;
+		terrainMesh.material.side = t3d.DRAW_SIDE.DOUBLE;
+		scene.add(terrainMesh);
+
+		console.timeEnd('create terrain');
+
+		console.time('set terrain noise');
+
+		const vertices = terrain.setImprovedNoise(0.3);
+		const l = vertices.array.length / 3;
+
+		console.timeEnd('set terrain noise');
+
+		const boundary = terrain.getBoundingBox(new t3d.Box3());
+		const largeScaleScene = new LargeScaleInstancedManager(boundary, {
+			treeType: 'quadtree', // 'octree' or 'quadtree'
+			maxDepth: 6
+		});
+
+		const _mat4_1 = new t3d.Matrix4();
+		const position = new t3d.Vector3();
+		const quaterion = new t3d.Quaternion();
+		const scale = new t3d.Vector3();
+		const yAxix = new t3d.Vector3(0, 1, 0);
+
+		function randomTransform() {
+			const idx_x = 3 * Math.floor(Math.random() * l);
+			const x = vertices.array[idx_x];
+			const y = vertices.array[idx_x + 1];
+			const z = vertices.array[idx_x + 2];
+
+			const size = 15;
+			scale.set(size, size, size).multiplyScalar(Math.random() * 0.7 + 0.3);
+			position.set(x, y, z);
+			quaterion.setFromAxisAngle(yAxix, Math.PI * 2 * Math.random());
+			_mat4_1.transform(position, scale, quaterion);
+		
+			return _mat4_1.toArray([]);
+		}
+
+		const octreeHelper = new OctreeHelper(0x000201);
+		octreeHelper.material.depthWrite = false;
+		octreeHelper.frustumCulled = false;
+		octreeHelper.visible = false;
+		scene.add(octreeHelper);
+
+		const models = [
+			{
+				url: './models/cedar/0.glb',
+				maxCount: 150000,
+				envMapIntensity: 0.3,
+				shadow: true
+			},
+			{
+				url: './models/cedar/1.glb',
+				maxCount: 150000,
+				envMapIntensity: 0.3,
+				shadow: true
+			},
+			{
+				url: './models/cedar/2.glb',
+				maxCount: 150000,
+				envMapIntensity: 1,
+				shadow: false
+			}
+		];
+
+		const gltfLoader = new GLTFLoader();
+		const loadTasks = models.map(({ url, maxCount, envMapIntensity, shadow }) => {
+			return gltfLoader.load(url).then(result => {
+				const group = new t3d.Group();
+
+				result.root.traverse(node => {
+					if (node.isMesh) {
+						const geometry = node.geometry.clone();
+						geometry.instanceCount = 0;
+
+						const material = new InstancedPBRMaterial(node.material);
+						material.envMapIntensity = envMapIntensity;
+						SceneUtils.getRelativeMatrixFromRoot(node, result.root, _mat4_1);
+						_mat4_1.toArray(material.uniforms.instanceOffset);
+
+						const mesh = new t3d.Mesh(geometry, material);
+						mesh.frustumCulled = false;
+						mesh.castShadow = shadow;
+						mesh.receiveShadow = shadow;
+
+						group.add(mesh);
+					}
+				});
+
+				scene.add(group);
+
+				largeScaleScene.registerResource(url, {
+					node: group,
+					maxCount: maxCount
+				});
+			});
+		});
+
+		Promise.all(loadTasks).then(() => {
+			// benchmark: v1 - 400ms
+			console.time('create instanced lod node');
+
+			const resources = models.map(model => model.url);
+			const distances = [-1, 1000, 4000];
+
+			// for (let i = 0, l = 150000; i < l; i++) {
+			// 	largeScaleScene.createInstancedLODNode({
+			// 		resources,
+			// 		distances,
+			// 		worldMatrix: randomTransform(),
+			// 		radius: 80
+			// 	});
+			// }
+
+			const worldMatrices = [], radiuses = [];
+			for (let i = 0, l = 150000; i < l; i++) {
+				worldMatrices.push(randomTransform());
+				radiuses.push(80);
+			}
+			largeScaleScene.createInstancedLODNodes({
+				resources,
+				distances,
+				worldMatrices: worldMatrices,
+				radiuses: radiuses
+			});
+
+			console.timeEnd('create instanced lod node');
+
+			octreeHelper.update(largeScaleScene.scheduler.getTree(), false);
+
+			console.log(largeScaleScene.scheduler.getTree());
+			console.log(largeScaleScene.scheduler.getTree().count());
+		}).catch(e => console.error(e));
+
+		largeScaleScene.scheduler.distance = 6000;
+		largeScaleScene.scheduler.strictHide = false;
+
+		const params = { scheduleViewer: false, phi: 65, theta: 45, shadowDistance: 1000 };
+		const gui = new GUI();
+		gui.add(largeScaleScene.scheduler, 'distance', 0, 8000);
+		gui.add(largeScaleScene.scheduler, 'strictHide');
+		const debugFolder = gui.addFolder('Debug');
+		debugFolder.add(params, 'scheduleViewer').onChange(value => {
+			controls.enabled = !value;
+			debugController.enabled = value;
+			if (value) {
+				debugCamera.position.copy(camera.position);
+				debugCamera.quaternion.copy(camera.quaternion);
+				debugController.target.copy(controls.target);
+			}
+		}).name('schedule viewer');
+		debugFolder.add(octreeHelper, 'visible').name('tree helper');
+		const environmentFolder = gui.addFolder('Environment').close();
+		environmentFolder.add({ fog: true }, 'fog').onChange(value => {
+			scene.fog = value ? fog : null;
+			sky_box.fog = value;
+		});
+		environmentFolder.add(scene.fog, 'near', 0, 1000, 1).name('fog near');
+		environmentFolder.add(scene.fog, 'far', 0, 20000, 1).name('fog far');
+		const lightFolder = gui.addFolder('Lights And Shadows').close();
+		lightFolder.add(params, 'phi', 0, 90, 0.1);
+		lightFolder.add(params, 'theta', 0, 360, 0.1);
+		lightFolder.add(directionalLight, 'castShadow');
+		lightFolder.add(params, 'shadowDistance', 1, 4000, 1);
+
+		const stats = new Stats();
+		stats.showPanel(0);
+		document.body.appendChild(stats.dom);
+
+		const lightSphere = new t3d.Sphere();
+		function loop(count) {
+			requestAnimationFrame(loop);
+			stats.begin();
+
+			controls.update();
+			debugController.update();
+
+			camera.updateMatrix();
+
+			ShadowAdapter.getSphereByBox3AndCamera(boundary, camera, near, params.shadowDistance, lightSphere);
+			ShadowAdapter.setDirectionalLight(directionalLight, params.phi / 180 * Math.PI, params.theta / 180 * Math.PI, lightSphere);
+
+			largeScaleScene.update(camera);
+
+			const renderCamera = params.scheduleViewer ? debugCamera : camera;
+			forwardRenderer.render(scene, renderCamera);
+
+			stats.end();
+		}
+		requestAnimationFrame(loop);
+
+		function onWindowResize() {
+			width = window.innerWidth || 2;
+			height = window.innerHeight || 2;
+
+			camera.setPerspective(fov / 180 * Math.PI, width / height, near, far);
+			debugCamera.setPerspective(fov / 180 * Math.PI, width / height, near, far);
+
+			forwardRenderer.backRenderTarget.resize(width, height);
+		}
+		window.addEventListener('resize', onWindowResize, false);
+
+		// fix depth material for instancing
+
+		const instancingParsVert = `
+			#ifdef USE_INSTANCING
+				attribute mat4 instanceMatrix;
+				uniform mat4 instanceOffset;
+			#endif
+		`;
+
+		const instancingPositionVert = `
+			#ifdef USE_INSTANCING
+				mat4 localInstanceMatrix = inverseMat4(instanceOffset) * instanceMatrix * instanceOffset;
+				transformed = (localInstanceMatrix * vec4(transformed, 1.0)).xyz;
+			#endif
+		`;
+
+		const depthVertexShader = `
+			#include <common_vert>
+			#include <morphtarget_pars_vert>
+			#include <skinning_pars_vert>
+			#include <uv_pars_vert>
+			#include <logdepthbuf_pars_vert>
+			${instancingParsVert}
+			void main() {
+				#include <uv_vert>
+				#include <begin_vert>
+				#include <morphtarget_vert>
+				#include <skinning_vert>
+				${instancingPositionVert}
+				#include <pvm_vert>
+				#include <logdepthbuf_vert>
+			}
+		`;
+
+		// override shadowMapPass.getDepthMaterial
+
+		const depthMaterials = [];
+		const shadowSide = { 'front': t3d.DRAW_SIDE.BACK, 'back': t3d.DRAW_SIDE.FRONT, 'double': t3d.DRAW_SIDE.DOUBLE };
+		forwardRenderer.shadowMapPass.getDepthMaterial = function(renderable) {
+			const useSkinning = !!renderable.object.skeleton;
+			const useMorphing = renderable.geometry.morphAttributes.position && renderable.geometry.morphAttributes.position.length > 0;
+			const useInstancing = renderable.material.defines.USE_INSTANCING;
+
+			const index = useMorphing << 0 | useSkinning << 1 | useInstancing << 2;
+
+			let material = depthMaterials[index];
+			if (material === undefined) {
+				material = new t3d.DepthMaterial();
+				material.type = t3d.MATERIAL_TYPE.SHADER;
+				material.packToRGBA = true;
+				material.shaderName = 'CUSTOM_DEPTH';
+				material.vertexShader = depthVertexShader;
+				material.fragmentShader = t3d.ShaderLib.depth_frag;
+
+				if (useInstancing) {
+					material.defines.USE_INSTANCING = true;
+					material.uniforms.instanceOffset = new Float32Array(16);
+				}
+
+				depthMaterials[index] = material;
+			}
+
+			material.side = shadowSide[renderable.material.side];
+
+			if (useInstancing) {
+				material.uniforms.instanceOffset.set(renderable.material.uniforms.instanceOffset);
+			}
+
+			return material;
+		};
+	</script>
+
+</body>
+
+</html>

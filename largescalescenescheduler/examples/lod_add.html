@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>instanced forest</title>
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="main.css">
+</head>
+
+<body>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "t3d": "../node_modules/t3d/build/t3d.module.js",
+                "t3d/addons/": "../node_modules/t3d/examples/jsm/",
+                "large-scale-scheduler": "../dist/large-scale-scheduler.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as t3d from 't3d';
+        import { SkyBox } from 't3d/addons/objects/SkyBox.js';
+        import { OrbitControls } from 't3d/addons/controls/OrbitControls.js';
+        import { TextureCubeLoader } from 't3d/addons/loaders/TextureCubeLoader.js';
+
+        import Stats from './libs/stats.module.js';
+        import { LargeScaleManager } from './jsm/LargeScaleManager.js';
+
+        let width = window.innerWidth || 2;
+        let height = window.innerHeight || 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        document.body.appendChild(canvas);
+
+        const contextParams = { antialias: true, alpha: false };
+        const gl = canvas.getContext('webgl2', contextParams) || canvas.getContext('webgl', contextParams);
+        const renderer = new t3d.WebGLRenderer(gl);
+        renderer.setClearColor(0.1, 0.1, 0.1, 1);
+        const backRenderTarget = new t3d.RenderTargetBack(canvas);
+
+        const scene = new t3d.Scene();
+
+        const fov = 45;
+        const aspect = 2;
+        const near = 1;
+        const far = 4000;
+        const camera = new t3d.Camera();
+        camera.lookAt(new t3d.Vector3(0, 0, 0), new t3d.Vector3(0, 1, 0));
+        camera.setPerspective(fov / 180 * Math.PI, aspect, near, far);
+        camera.position.set(0, 50, 50);
+        scene.add(camera);
+
+        const skyboxTexture = new TextureCubeLoader().load([
+        	'./images/sky_box/right.jpg',
+        	'./images/sky_box/left.jpg',
+        	'./images/sky_box/top.jpg',
+        	'./images/sky_box/bottom.jpg',
+        	'./images/sky_box/front.jpg',
+        	'./images/sky_box/back.jpg'
+
+        ]);
+        const sky_box = new SkyBox(skyboxTexture);
+        camera.add(sky_box);
+
+        const controls = new OrbitControls(camera, canvas);
+        controls.minDistance = 10;
+        controls.maxDistance = 100000;
+        controls.enableDamping = true;
+
+        const amLight = new t3d.AmbientLight(0xffffff, 1.2);
+        scene.add(amLight);
+
+        const light = new t3d.DirectionalLight(0xffffff, 1.0);
+        light.position.set(-10, 280, 50);
+        light.lookAt(new t3d.Vector3(), new t3d.Vector3(0, 1, 0));
+        scene.add(light);
+
+        const boundary = new t3d.Box3();
+        const templates = [
+        	new t3d.Mesh(new t3d.SphereGeometry(1, 64, 64), new t3d.BasicMaterial()),
+        	new t3d.Mesh(new t3d.SphereGeometry(2, 32, 32), new t3d.BasicMaterial()),
+        	new t3d.Mesh(new t3d.SphereGeometry(3, 1, 1), new t3d.BasicMaterial())
+        ];
+        templates.forEach(function(template, index) {
+        	boundary.expandByPoint(template.position);
+        	template.updateMatrix();
+        	template.material.diffuse.setRGB(Math.random(), Math.random(), Math.random());
+        	template.material.drawMode = t3d.DRAW_MODE.LINE_LOOP;
+        });
+
+        const lod = {
+        	worldMatrix: templates[2].worldMatrix,
+        	nodes: templates.map(function(template) {
+        		const node = template.clone();
+        		node.visible = false;
+        		scene.add(node);
+        		return node;
+        	}),
+        	distances: [20, 30, 50]
+        };
+
+        const largeScaleScene = new LargeScaleManager(boundary, { capacity: 8 });
+        largeScaleScene.scheduler.distance = 200;
+
+        largeScaleScene.createLODNode(lod, 'add');
+
+        const stats = new Stats();
+        stats.showPanel(0);
+        document.body.appendChild(stats.dom);
+
+        const renderOption = {};
+        function loop(count) {
+        	requestAnimationFrame(loop);
+        	stats.begin();
+
+        	controls.update();
+
+        	scene.updateMatrix();
+
+        	const renderStates = scene.updateRenderStates(camera);
+        	largeScaleScene.update(camera);
+
+        	renderer.setRenderTarget(backRenderTarget);
+        	renderer.clear(true, true, false);
+
+        	const mainLayer = scene.updateRenderQueue(camera).getLayer(0);
+        	renderer.beginRender();
+        	renderer.renderRenderableList(mainLayer.opaque, renderStates, renderOption);
+        	renderer.renderRenderableList(mainLayer.transparent, renderStates, renderOption);
+        	renderer.endRender();
+
+        	stats.end();
+        }
+        requestAnimationFrame(loop);
+
+        function onWindowResize() {
+        	width = window.innerWidth || 2;
+        	height = window.innerHeight || 2;
+
+        	camera.setPerspective(45 / 180 * Math.PI, width / height, 1, 2000);
+
+        	backRenderTarget.resize(width, height);
+        }
+        window.addEventListener('resize', onWindowResize, false);
+    </script>
+
+</body>
+
+</html>
